@@ -11,10 +11,6 @@ const RatingCard = ({ title, rating, icon }) => {
         <div className="flex items-baseline space-x-2 mb-2">
           <span className="text-3xl font-bold text-white">{rating}</span>
         </div>
-        {/* Placeholder for the small graph */}
-        <div className="h-10 w-full bg-gray-600 rounded-sm">
-          {/* A real graph would go here */}
-        </div>
       </div>
     </div>
   );

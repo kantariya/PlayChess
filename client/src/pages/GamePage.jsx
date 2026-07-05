@@ -69,7 +69,7 @@ const normalizeGameData = (raw) => {
   const data = { ...raw };
   const players = (raw.players || []).map(p => {
     const userObj = (p.user && typeof p.user === 'object')
-      ? { _id: String(p.user._id || p.user), username: p.user.username, country: p.user.country }
+      ? { _id: String(p.user._id || p.user), username: p.user.username, country: p.user.country, rating: p.rating }
       : { _id: String(p.user) };
     return {
       ...p,
@@ -123,9 +123,9 @@ const GamePage = () => {
   const [moveHistory, setMoveHistory] = useState([]);
   const [replayIndex, setReplayIndex] = useState(0); // index = #moves shown. index === moveHistory.length -> live
 
-  const [promotionMove, setPromotionMove] = useState(null);
   const [gameOver, setGameOver] = useState(false);
   const [gameOverData, setGameOverData] = useState(null);
+  const [promotionMove, setPromotionMove] = useState(null); // { from, to, fenBefore }
 
 
   const serverTimeRef = useRef({ w: 0, b: 0 });
@@ -177,31 +177,48 @@ const GamePage = () => {
       setIsLoading(false);
     };
 
-    if (gameData) {
-      setupGame(gameData);
-    } else {
-      setIsLoading(true);
-      axiosInstance.get(`/games/${gameId}`)
-        .then(res => setupGame(res.data))
-        .catch(err => {
-          console.error('Failed to fetch game data', err);
+    // Check location.state directly, NOT the gameData state variable
+    console.log("Fetching authoritative game data from API...");
+    axiosInstance.get(`/games/${gameId}`)
+      .then(res => {
+        console.log("Authoritative data with moves received:", res.data);
+        // This setupGame call will have res.data.moves
+        // This is the call that will correctly populate the move history
+        setupGame(res.data);
+      })
+      .catch(err => {
+        console.error('Failed to fetch authoritative game data', err);
+        // Only set loading false on error if we didn't have location.state
+        if (!location.state?.gameData) {
           setIsLoading(false);
-        });
-    }
+        }
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gameId, user]);
+  }, [gameId, user]); // Dependencies are now correct
 
   // socket listeners
+  // NEW HOOK: Handles connection and joining/leaving the room
   useEffect(() => {
     if (!gameId) return;
 
-    if (!socket.connected) {
-      const token = localStorage.getItem('token');
-      if (token) socket.auth = { token };
+    if (!socket.connected && !socket.active) {
       socket.connect();
     }
 
+    // Join the room
     socket.emit('joinGameRoom', gameId);
+
+    // Return a cleanup function to leave the room
+    return () => {
+      socket.emit('leaveGameRoom', gameId);
+    };
+  }, [gameId]); // This hook ONLY runs when gameId changes
+
+  // MODIFIED HOOK: Handles setting up event listeners
+  useEffect(() => {
+    // We no longer connect or join the room here.
+    // We just attach listeners.
+    if (!gameId) return;
 
     const handleGameUpdate = (data) => {
       // console.log('gameUpdate (client):', data);
@@ -238,7 +255,7 @@ const GamePage = () => {
           }
           const next = [...prev, data.lastMove];
           // if user is viewing live, advance replay index
-          if (replayIndex === prev.length) {
+          if (replayIndex === prev.length) { // Check against PREV length
             setReplayIndex(next.length);
             if (data.newFen) setFen(data.newFen);
           }
@@ -262,26 +279,27 @@ const GamePage = () => {
       setGameOver(true);
     };
 
-    socket.on('gameUpdate', handleGameUpdate);
-    socket.on('timeUpdate', handleTimeUpdate);
-    socket.on('gameOver', handleGameOver);
-
-    socket.on('drawOffered', ({ from }) => {
+    const handleDrawOffer = ({ from }) => {
       if (window.confirm(`${from} offered a draw. Accept?`)) {
         socket.emit('acceptDraw', { gameId });
       }
-    });
+    };
 
+    // Attach listeners
+    socket.on('gameUpdate', handleGameUpdate);
+    socket.on('timeUpdate', handleTimeUpdate);
+    socket.on('gameOver', handleGameOver);
+    socket.on('drawOffered', handleDrawOffer);
+
+    // Return a cleanup function to remove listeners
     return () => {
       socket.off('gameUpdate', handleGameUpdate);
       socket.off('timeUpdate', handleTimeUpdate);
       socket.off('gameOver', handleGameOver);
-      socket.off('drawOffered');
-      socket.emit('leaveGameRoom', gameId);
+      socket.off('drawOffered', handleDrawOffer);
     };
 
-    // replayIndex intentionally not added to deps to avoid listener re-attach churn
-  }, [gameId, moveHistory.length, replayIndex, user]);
+  }, [gameId, moveHistory.length, replayIndex, user]); // These dependencies are now safe
 
   /* ---------- helpers for interaction ---------- */
 
@@ -318,62 +336,56 @@ const GamePage = () => {
 
 
   // move handlers for react-chessboard v4 (source, target, piece)
+  // client/src/pages/GamePage.jsx
+
   const onPieceDrop = useCallback((sourceSquare, targetSquare, pieceStr) => {
-    // console.log('onPieceDrop called:', sourceSquare, targetSquare, pieceStr);
     if (gameOver) return false;
     if (!playerColor) return false;
-    if (chessRef.current.turn() !== playerColor) {
-      // not player's turn
-      return false;
-    }
+    if (chessRef.current.turn() !== playerColor) return false;
 
-    const parsed = parsePieceString(pieceStr);
-    const copy = new Chess(chessRef.current.fen());
-
-    const moveData = {
-      from: sourceSquare,
-      to: targetSquare,
-      promotion: 'q' // A temporary piece is required for the check
-    };
-
-    // promotion detection
-    console.log('Parsed piece:', parsed);
-    if (parsed && parsed.type === 'p') {
-      console.log('targetSquare:', targetSquare);
+    // detect promotion by source piece + target rank
+    const srcPiece = chessRef.current.get(sourceSquare); // {type:'p', color:'w'|'b'} or null
+    if (srcPiece && srcPiece.type === 'p') {
       const targetRank = targetSquare[1];
-      if ((parsed.color === 'w' && targetRank === '8') || (parsed.color === 'b' && targetRank === '1')) {
-        console.log('Detected promotion move');
-        setPromotionMove({ from: sourceSquare, to: targetSquare, color: parsed.color });
-        return false; // wait for promotion dialog
+      const willPromote =
+        (srcPiece.color === 'w' && targetRank === '8') ||
+        (srcPiece.color === 'b' && targetRank === '1');
+
+      if (willPromote) {
+        // open our modal; DO NOT move yet
+        setPromotionMove({
+          from: sourceSquare,
+          to: targetSquare,
+          color: srcPiece.color,
+          fenBefore: chessRef.current.fen(),
+        });
+        return false; // keep board as-is until user picks a piece
       }
     }
 
-    let result = null;
+    // normal move path
+    const temp = new Chess(chessRef.current.fen());
+    const result = temp.move({ from: sourceSquare, to: targetSquare });
+    if (!result) return false;
 
-    try {
-      result = copy.move({ from: sourceSquare, to: targetSquare });
-    }
-    catch (e) {
-      console.error('Error processing move:', e);
-    }
-    if (result === null) {
-      // illegal move
-      return false;
+    if (replayIndex === moveHistory.length) {
+      setFen(temp.fen());
     }
 
-    // optimistic board update only if user is in live mode
-    const atLive = replayIndex === moveHistory.length;
-    if (atLive) setFen(copy.fen());
-
-    // send standardized payload to server
-    socket.emit('move', { gameId, move: { from: sourceSquare, to: targetSquare, promotion: 'q' } });
+    socket.emit('move', { gameId, move: { from: sourceSquare, to: targetSquare } });
     return true;
-  }, [gameId, playerColor, replayIndex, moveHistory.length]);
+  }, [gameOver, playerColor, replayIndex, moveHistory.length, gameId]);
+
+
+
+
 
   const onDropFallback = useCallback((from, to, piece) => onPieceDrop(from, to, piece), [onPieceDrop]);
 
-  // click-to-move fallback
+
+
   const lastClickedSquare = useRef(null);
+
   const onSquareClick = useCallback((square) => {
     if (!lastClickedSquare.current) {
       const piece = chessRef.current.get(square);
@@ -382,37 +394,86 @@ const GamePage = () => {
       lastClickedSquare.current = square;
       return;
     }
+
     const from = lastClickedSquare.current;
+    const to = square;
     lastClickedSquare.current = null;
 
-    const copy = new Chess(chessRef.current.fen());
-    const piece = copy.get(from);
-    console.log('piece at from:', piece);
-    console.log('target square:', square);
-    if (piece && piece.type === 'p') {
-      const targetRank = square[1];
-      if ((piece.color === 'w' && targetRank === '8') || (piece.color === 'b' && targetRank === '1')) {
-        setPromotionMove({ from, to: square, color: piece.color });
-        return;
+    const srcPiece = chessRef.current.get(from);
+    if (srcPiece && srcPiece.type === 'p') {
+      const targetRank = to[1];
+      const willPromote =
+        (srcPiece.color === 'w' && targetRank === '8') ||
+        (srcPiece.color === 'b' && targetRank === '1');
+
+      if (willPromote) {
+        setPromotionMove({
+          from,
+          to,
+          color: srcPiece.color,
+          fenBefore: chessRef.current.fen(),
+        });
+        return; // wait for modal selection
       }
     }
-    const result = copy.move({ from, to: square });
+
+    // normal move
+    const temp = new Chess(chessRef.current.fen());
+    const result = temp.move({ from, to });
     if (!result) return;
-    const atLive = replayIndex === moveHistory.length;
-    if (atLive) setFen(copy.fen());
-    socket.emit('move', { gameId, move: { from, to: square, promotion: 'q' } });
-  }, [gameId, playerColor, replayIndex, moveHistory.length]);
 
+    if (replayIndex === moveHistory.length) {
+      setFen(temp.fen());
+    }
+
+    socket.emit('move', { gameId, move: { from, to } });
+  }, [playerColor, replayIndex, moveHistory.length, gameId]);
+
+
+
+
+
+  // This is called by react-chessboard AFTER the user
+  // clicks a piece in the built-in dialog.
   const handlePromotion = useCallback((pieceChar) => {
-    const handlePromotion = (piece) => {
-      if (!promotionMove) return;
+    // pieceChar is one of: 'q','r','b','n'
+    if (!promotionMove) return;
 
-      // Emit the move WITH the promotion key chosen by the user
-      socket.emit('move', { gameId, move: { ...promotionMove, promotion: piece } });
+    try {
+      // restore the exact pre-move state
+      const temp = new Chess(promotionMove.fenBefore);
 
-      setPromotionMove(null); // Close dialog
-    };
-  }, [promotionMove, gameId, replayIndex, moveHistory.length]);
+      const moveData = {
+        from: promotionMove.from,
+        to: promotionMove.to,
+        promotion: pieceChar, // 'q' | 'r' | 'b' | 'n'
+      };
+
+      const result = temp.move(moveData);
+      if (!result) {
+        console.warn('Invalid promotion move:', moveData);
+        setPromotionMove(null);
+        return;
+      }
+
+      // sync local board
+      chessRef.current.load(temp.fen());
+      if (replayIndex === moveHistory.length) {
+        setFen(temp.fen());
+      }
+
+      // emit to server
+      socket.emit('move', { gameId, move: moveData });
+
+    } finally {
+      setPromotionMove(null); // close modal
+    }
+  }, [promotionMove, replayIndex, moveHistory.length, gameId]);
+
+
+
+
+
 
   // captured pieces and material diff
   const capturedInfo = useMemo(() => {
@@ -452,13 +513,46 @@ const GamePage = () => {
 
   return (
     <div className="w-screen h-screen bg-gray-800 text-white flex flex-col">
-      {promotionMove && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-        <div className="bg-gray-700 p-4 rounded-lg flex space-x-2">
-          {['q', 'r', 'b', 'n'].map(p => (
-            <button key={p} onClick={() => handlePromotion(p)} className="w-16 h-16 flex items-center justify-center border rounded-md text-2xl font-bold hover:bg-gray-600">{p.toUpperCase()}</button>
-          ))}
+      {promotionMove && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+
+          <div className="bg-[#222] p-3 rounded-lg shadow-xl border border-gray-600 flex space-x-2">
+
+            {['q', 'r', 'b', 'n'].map(p => {
+              // pick correct unicode symbol per piece + color
+              const symbols = {
+                w: { q: "♕", r: "♖", b: "♗", n: "♘" },
+                b: { q: "♛", r: "♜", b: "♝", n: "♞" }
+              };
+
+              const icon = symbols[promotionMove.color][p];
+
+              return (
+                <button
+                  key={p}
+                  onClick={() => handlePromotion(p)}
+                  className="
+              w-16 h-16 
+              flex items-center justify-center 
+              bg-[#333] 
+              hover:bg-[#444]
+              border border-gray-500 
+              rounded-md 
+              text-4xl
+              text-white
+              transition
+              shadow-lg
+            "
+                >
+                  {icon}
+                </button>
+              );
+            })}
+
+          </div>
         </div>
-      </div>}
+      )}
+
       <nav className="bg-gray-900 w-full p-2 flex items-center justify-between shadow-md flex-shrink-0">
         <Link to="/" className="text-xl font-bold">← Dashboard</Link>
         <div className="text-center">
@@ -474,15 +568,17 @@ const GamePage = () => {
             <Clock timeInMillis={topClock} />
           </div>
 
-          <div className="w-full max-w-[calc(100vh-150px)] aspect-square my-2" onMouseDown={(e) => console.log('board wrapper mouse down target:', e.target)}>
+          <div className="w-full max-w-[calc(100vh-150px)] aspect-square my-2">
             <Chessboard
               id="MainChessboard"
               position={fen}
               boardOrientation={boardOrientation}
               onPieceDrop={onPieceDrop}
-              onDrop={onDropFallback}
               onSquareClick={onSquareClick}
-              arePiecesDraggable={playerColor === turn && replayIndex === moveHistory.length}
+              onPromotionDialogOpen={() => { }}
+              showPromotionDialog={(false)} // we handle promotion ourselves
+              customPromotionDialog={null}
+              arePiecesDraggable={playerColor === turn && replayIndex === moveHistory.length && !promotionMove}
               customBoardStyle={{ borderRadius: '4px', boxShadow: '0 5px 15px rgba(0,0,0,0.5)' }}
               customDarkSquareStyle={{ backgroundColor: '#779952' }}
               customLightSquareStyle={{ backgroundColor: '#edeed1' }}

@@ -20,7 +20,9 @@ const PlayOptions = () => {
 
   const handlePlayClick = (timeControl) => {
     setIsSearching(true);
-    socket.connect(); // Ensure the socket is connected before emitting
+    if (!socket.connected && !socket.active) {
+      socket.connect();
+    }
     socket.emit('joinPool', { timeControl });
     console.log('timeControl selected:', timeControl);
   };

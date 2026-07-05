@@ -14,6 +14,7 @@ import RegisterPage from "./pages/RegisterPage.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import GamePage from "./pages/GamePage.jsx";
 import GameReplay from "./pages/GameReplay.jsx";
+import ProfilePage from "./pages/ProfilePage.jsx";
 
 
 
@@ -33,8 +34,8 @@ const App = () => {
           <Route element={<ProtectLayout />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/replay/:gameId" element={<GameReplay />} />
+            <Route path="/profile" element={<ProfilePage />} />
             {/* Add other protected routes here later */}
-            {/* e.g., <Route path="/profile" element={<ProfilePage />} /> */}
           </Route>
         </Route>
 

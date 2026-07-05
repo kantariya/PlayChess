@@ -25,7 +25,7 @@ async function finalizeGame(io, liveGames, gameId, game, winner, reason, resultT
   // Determine the time control of the game
   const ratingKey = game.category.toLowerCase(); // e.g., 'bullet', 'blitz', 'rapid', 'classical'
 
- 
+
 
   const newWhiteRating = calculateElo(
     white.rating,
@@ -94,52 +94,162 @@ async function finalizeGame(io, liveGames, gameId, game, winner, reason, resultT
  * - liveGames is passed in by the socket initializer and is the source of truth for timers while server is running
  */
 
-export const findMatch = (timeControl, category, io, matchmakingPools, liveGames) => {
-  const pool = matchmakingPools[timeControl];
-  if (!pool || pool.length < 2) return;
+const MATCHMAKING_BUCKET_SIZE = 50;
 
-  pool.sort((a, b) => a.rating - b.rating);
+const getBucketId = (rating, bucketSize = MATCHMAKING_BUCKET_SIZE) => Math.floor(rating / bucketSize);
 
-  for (let i = 0; i < pool.length - 1; i++) {
-    const player1 = pool[i];
+const createPoolState = (category) => ({
+  category,
+  bucketSize: MATCHMAKING_BUCKET_SIZE,
+  buckets: new Map(),
+  socketIndex: new Map(),
+  size: 0,
+});
 
-    let bestOpponent = null;
-    let smallestDiff = Infinity;
+const getOrCreatePool = (timeControl, category, matchmakingPools) => {
+  if (!matchmakingPools[timeControl] || !matchmakingPools[timeControl].buckets) {
+    matchmakingPools[timeControl] = createPoolState(category);
+  }
 
-    for (let j = i + 1; j < pool.length; j++) {
-      const player2 = pool[j];
-      if (player1.userId === player2.userId) continue;
-      const diff = Math.abs(player1.rating - player2.rating);
-      if (diff < smallestDiff) {
-        smallestDiff = diff;
-        bestOpponent = player2;
+  if (category && !matchmakingPools[timeControl].category) {
+    matchmakingPools[timeControl].category = category;
+  }
+
+  return matchmakingPools[timeControl];
+};
+
+const removePlayerBySocketId = (pool, socketId) => {
+  const bucketId = pool.socketIndex.get(socketId);
+  if (bucketId === undefined) return null;
+
+  const bucket = pool.buckets.get(bucketId);
+  if (!bucket) {
+    pool.socketIndex.delete(socketId);
+    return null;
+  }
+
+  const index = bucket.findIndex((player) => player.socketId === socketId);
+  if (index === -1) {
+    pool.socketIndex.delete(socketId);
+    return null;
+  }
+
+  const [removed] = bucket.splice(index, 1);
+  pool.socketIndex.delete(socketId);
+  pool.size = Math.max(0, pool.size - 1);
+
+  if (bucket.length === 0) {
+    pool.buckets.delete(bucketId);
+  }
+
+  return removed;
+};
+
+const addPlayerToPool = (pool, player) => {
+  removePlayerBySocketId(pool, player.socketId);
+
+  const bucketId = getBucketId(player.rating, pool.bucketSize);
+  if (!pool.buckets.has(bucketId)) {
+    pool.buckets.set(bucketId, []);
+  }
+
+  pool.buckets.get(bucketId).push(player);
+  pool.socketIndex.set(player.socketId, bucketId);
+  pool.size += 1;
+};
+
+const getAcceptableRange = (joinedAt) => {
+  const waitTime = (Date.now() - joinedAt) / 1000;
+  return 100 + (Math.floor(waitTime / 10) * 50);
+};
+
+const findBestOpponent = (pool, player, io) => {
+  const acceptableRange = getAcceptableRange(player.joinedAt);
+  const bucketDelta = Math.ceil(acceptableRange / pool.bucketSize);
+  const playerBucket = getBucketId(player.rating, pool.bucketSize);
+
+  let bestOpponent = null;
+  let smallestDiff = Infinity;
+
+  for (let delta = 0; delta <= bucketDelta; delta++) {
+    const bucketsToScan = delta === 0 ? [playerBucket] : [playerBucket - delta, playerBucket + delta];
+
+    for (const bucketId of bucketsToScan) {
+      const bucket = pool.buckets.get(bucketId);
+      if (!bucket || bucket.length === 0) continue;
+
+      for (const opponent of bucket) {
+        if (opponent.socketId === player.socketId) continue;
+        if (opponent.userId === player.userId) continue;
+        if (!io.sockets.sockets.has(opponent.socketId)) continue;
+
+        const diff = Math.abs(player.rating - opponent.rating);
+        if (diff <= acceptableRange && diff < smallestDiff) {
+          smallestDiff = diff;
+          bestOpponent = opponent;
+        }
       }
     }
+  }
 
-    console.log('Best opponent for', player1.userId, 'is', bestOpponent ? bestOpponent.userId : 'none', 'with diff', smallestDiff);
+  return { bestOpponent, smallestDiff, acceptableRange };
+};
 
-    if (bestOpponent) {
-      const waitTime = (Date.now() - player1.joinedAt) / 1000;
-      const acceptableRange = 100 + (Math.floor(waitTime / 10) * 50);
+export const enqueuePlayerInPool = (timeControl, category, matchmakingPools, player) => {
+  const pool = getOrCreatePool(timeControl, category, matchmakingPools);
+  addPlayerToPool(pool, player);
+  return pool;
+};
 
-      if (smallestDiff <= acceptableRange) {
-        matchmakingPools[timeControl] = pool.filter(p => p.userId !== player1.userId && p.userId !== bestOpponent.userId);
+export const removePlayerFromAllPools = (matchmakingPools, socketId) => {
+  for (const timeControl in matchmakingPools) {
+    const pool = matchmakingPools[timeControl];
+    if (!pool || !pool.buckets) continue;
+    removePlayerBySocketId(pool, socketId);
+  }
+};
 
-        const players = Math.random() < 0.5 ? [player1, bestOpponent] : [bestOpponent, player1];
+export const findMatch = (timeControl, category, io, matchmakingPools, liveGames) => {
+  const pool = getOrCreatePool(timeControl, category, matchmakingPools);
+  if (pool.size < 2) return;
 
-        console.log(`Match found between ${players[0].userId} and ${players[1].userId} in pool ${timeControl} (${category}) with rating diff ${smallestDiff} (acceptable: ${acceptableRange})`);
+  for (const bucketId of pool.buckets.keys()) {
+    const bucket = pool.buckets.get(bucketId);
+    if (!bucket || bucket.length === 0) continue;
 
-        createGame(players[0], players[1], timeControl, io, liveGames,category);
-
-        // schedule next match attempt asynchronously
-        setTimeout(() => findMatch(timeControl,category, io, matchmakingPools, liveGames), 0);
-        return;
+    for (const player of [...bucket]) {
+      if (!io.sockets.sockets.has(player.socketId)) {
+        removePlayerBySocketId(pool, player.socketId);
+        continue;
       }
+
+      const { bestOpponent, smallestDiff, acceptableRange } = findBestOpponent(pool, player, io);
+      if (!bestOpponent) continue;
+
+      const playerExists = !!pool.socketIndex.get(player.socketId);
+      const opponentExists = !!pool.socketIndex.get(bestOpponent.socketId);
+      if (!playerExists || !opponentExists) continue;
+
+      removePlayerBySocketId(pool, player.socketId);
+      removePlayerBySocketId(pool, bestOpponent.socketId);
+
+      const players = Math.random() < 0.5 ? [player, bestOpponent] : [bestOpponent, player];
+
+      console.log(
+        `Match found between ${players[0].userId} and ${players[1].userId} in pool ${timeControl} (${pool.category || category}) with rating diff ${smallestDiff} (acceptable: ${acceptableRange})`
+      );
+
+      createGame(players[0], players[1], timeControl, io, liveGames, pool.category || category);
+
+      if (pool.size >= 2) {
+        setTimeout(() => findMatch(timeControl, pool.category || category, io, matchmakingPools, liveGames), 0);
+      }
+      return;
     }
   }
 };
 
-export const createGame = async (whitePlayer, blackPlayer, timeControl, io, liveGames,category) => {
+export const createGame = async (whitePlayer, blackPlayer, timeControl, io, liveGames, category) => {
   try {
     const { minutes, increment } = getTimeControlInfo(timeControl);
     const initialFen = new Chess().fen();
@@ -425,10 +535,11 @@ export const handleOfferDraw = (io, socket, liveGames) => {
   const offeringPlayer = game.players.find(p => p.userId === socket.userId);
   const opponent = game.players.find(p => p.userId !== socket.userId);
 
+
   if (opponent) {
     const opponentSocket = io.sockets.sockets.get(opponent.socketId);
     if (opponentSocket) {
-      opponentSocket.emit("drawOffered", {
+      socket.to(gameId).emit("drawOffered", {
         from: offeringPlayer.user.username,
         gameId
       });
@@ -466,6 +577,7 @@ export const handleAcceptDraw = async (io, socket, liveGames) => {
 };
 
 const findGameIdBySocketId = (socketId, liveGames) => {
+  console.log('Finding gameId for socketId:', socketId, 'in liveGames:', Object.keys(liveGames));
   return Object.keys(liveGames).find(gameId =>
     liveGames[gameId].players.some(p => p.socketId === socketId)
   );

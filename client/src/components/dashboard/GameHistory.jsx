@@ -92,7 +92,7 @@ const GameHistory = ({ games, currentUser }) => {
                       <ResultIcon winner={game.winner} playerColor={playerInfo.color} />
                     </div>
                   </td>
-                  <td className="p-3 text-gray-300">{Math.ceil(game.pgn.split(' ').length / 2)}</td>
+                  <td className="p-3 text-gray-300">{game.moves.length}</td>
                   <td className="p-3 text-gray-400">{new Date(game.createdAt).toLocaleDateString()}</td>
                 </tr>
               )

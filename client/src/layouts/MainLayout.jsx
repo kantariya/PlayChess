@@ -14,29 +14,30 @@ const MainLayout = () => {
       navigate(`/game/${data.gameId}`, { state: { gameData: data } });
     };
 
-    // Ensure the global socket is connected once, and supply token if available
+    // Ensure the global socket is connected once.
     try {
-      // If using socket.io-client v4, set auth before connect:
-      if (socket && !socket.connected) {
-        // try to attach token from localStorage (adjust if you store elsewhere)
-        const token = localStorage.getItem('token');
-        if (token) {
-          // set auth for initial handshake
-          socket.auth = { token };
-        }
+      if (socket && !socket.connected && !socket.active) {
         socket.connect();
       }
     } catch (err) {
       console.warn('Socket connect check failed:', err);
-      socket.connect();
+      if (!socket.connected && !socket.active) {
+        socket.connect();
+      }
     }
 
     socket.on('matchFound', onMatchFound);
+
+    const onConnectError = (error) => {
+      console.error('Frontend socket connect_error:', error.message);
+    };
+    socket.on('connect_error', onConnectError);
 
     // cleanup: remove listener but DO NOT disconnect the global socket,
     // so navigation between pages won't drop the connection.
     return () => {
       socket.off('matchFound', onMatchFound);
+      socket.off('connect_error', onConnectError);
     };
   }, [navigate]);
 
