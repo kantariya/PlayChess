@@ -56,7 +56,7 @@ pipeline {
             steps {
                 sshagent(credentials: ['playchess-ec2']) {
                     sh '''
-                    ssh -o StrictHostKeyChecking=no ec2-user@13.233.75.40 \
+                    ssh -o StrictHostKeyChecking=no ec2-user@13.233.5.142 \
                     "~/deploy.sh"
                     '''
                 }
