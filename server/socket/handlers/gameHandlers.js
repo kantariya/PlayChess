@@ -538,10 +538,17 @@ export const handleOfferDraw = (io, socket, liveGames) => {
 
   if (opponent) {
     const opponentSocket = io.sockets.sockets.get(opponent.socketId);
+    console.log(`Draw offer from ${offeringPlayer.user.username} to ${opponent.user.username} in game ${gameId} opponentSocket:`, opponentSocket ? 'found' : 'not found');
     if (opponentSocket) {
-      socket.to(gameId).emit("drawOffered", {
+      opponentSocket.emit("drawOffered", {
         from: offeringPlayer.user.username,
         gameId
+      });
+      console.log(`Draw offer sent from ${socket.userId} to ${opponent.userId} in game ${gameId}`);
+    } else {
+      console.warn(`Could not find opponent socket for draw offer in game ${gameId}`, {
+        opponentUserId: opponent.userId,
+        opponentSocketId: opponent.socketId
       });
     }
   }
